@@ -1,0 +1,41 @@
+input:
+  video: data/sequences/DroneSim.mp4
+
+output:
+  dir: ./out/severity/cfg_severity
+
+device: cuda:0
+save_annotated_frames_frequency: 30
+
+# ── Detector ──────────────────────────────────────────────────────────────────
+# Use a YOLO model fine-tuned on VistaCrash so that the "crashed_car" class
+# provides an immediate binary severity signal at detection time.
+# Replace with your best VistaCrash checkpoint (e.g. from cfg32.yaml run).
+yolo:
+  model: runs/detect/vistacrashe_x/weights/best.pt   # set after training
+  base_model: yolo12x.pt                              # downloaded automatically
+  conf: 0.05
+
+# ── Severity pipeline ─────────────────────────────────────────────────────────
+pipeline:
+  class: vista.pipeline.severity.SeverityPipeline
+  caption_stride: 30       # run VLM every 30 frames (~1 s at 30 FPS)
+  history_len: 5           # captions retained per track for peak-severity
+  check_emergency: true    # probe trucks/buses for ambulance/police identity
+
+# ── VLM captioner (zero-shot — no VISTA-label supervision) ───────────────────
+# The VLM is called only to *refine* severity on per-track crops.
+# It is never shown ground-truth VISTA captions during inference.
+qwen:
+  model_id: unsloth/Qwen3-VL-32B-Instruct-unsloth-bnb-4bit
+  max_new_tokens: 32        # severity labels are short; keep generation tight
+  image_target_size: 512    # crops are small; lower resolution is sufficient
+  # Severity-focused system prompt — constrains the VLM to the severity
+  # vocabulary defined in vista/utils/severity.py.
+  system_prompt: >
+    You are a computer vision assistant analysing image crops from a UAV
+    accident scene. Your only task is to assign a short severity label to the
+    object shown in each crop. Follow the instructions in the user message
+    exactly. Reply with only the requested label — no explanations, no
+    punctuation outside the label itself.
+  user_prompt: ""           # per-crop prompt injected at runtime by SeverityPipeline

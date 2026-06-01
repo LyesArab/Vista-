@@ -1,5 +1,5 @@
 input:
-  video: data/sequences/bike_0.mp4
+  video: /content/drive/MyDrive/VISTA_data/DJI_20251120172410_0001_S.mp4
 
 output:
   dir: ./out/yoloqwen/cfg1
@@ -35,4 +35,4 @@ qwen:
     - Example valid response:
       `[{"bbox_2d": [10, 30, 20, 60], "label": "car involved in accident"}, {"bbox_2d": [40, 15, 52, 27], "label": "person injured, sitting"}]`
     - Ensure each object is labeled with a precise description reflecting its type and status.
-  user_prompt:
+  user_prompt: "Analyze the current frame. Detect and label all accident-relevant objects."

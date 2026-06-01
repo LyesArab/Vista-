@@ -8,10 +8,17 @@ from transformers import (
     Qwen3VLMoeForConditionalGeneration
 )
 from qwen_vl_utils import process_vision_info
-from vllm import LLM, SamplingParams
 from .utils import set_seed, image_to_base64, resize_image, log
-from unsloth import FastVisionModel
 import torch
+try:
+    from vllm import LLM, SamplingParams
+except ImportError:
+    LLM = None
+    SamplingParams = None
+try:
+    from unsloth import FastVisionModel
+except ImportError:
+    FastVisionModel = None
 
 
 def build_qwen_chat(current_frame, cfg, history):
@@ -109,7 +116,8 @@ class QwenVLHF(QwenVLforObjectDetection):
             for v in video_inputs:
                 log(f"Video input detected with shape: {v.shape}")
         else:
-            video_metadatas = None, None
+            video_inputs = None
+            video_metadatas = None
 
         inputs = self.processor(
             text=[text],
@@ -216,6 +224,8 @@ def get_model(cfg):
     device = cfg["device"]
 
     if model_id == "Qwen/Qwen3-VL-32B-Instruct-FP8":
+        if LLM is None:
+            raise ImportError("vllm is required for Qwen3-VL-32B. Install it with: pip install vllm")
         processor = AutoProcessor.from_pretrained(cfg["qwen"]["model_id"])
         llm = LLM(
             model=model_id,
@@ -286,3 +296,20 @@ def get_unsloth(model_id, device, cfg):
         device=device,
         cfg=cfg,
     )
+
+
+log("Starting video loop")
+
+start_time = time.time()
+frame_count = 0
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    # ...existing processing...
+    frame_count += 1
+
+end_time = time.time()
+fps = frame_count / (end_time - start_time)
+print(f"Detection/Tracking FPS: {fps:.2f}")

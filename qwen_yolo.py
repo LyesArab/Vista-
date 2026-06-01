@@ -192,6 +192,9 @@ def run_pipeline(cfg: dict):
     else:
         frame_idx = 0
 
+    join_tracks: Dict[int, Dict] = {}
+    qwen_only_tracks: Dict[int, Dict] = {}
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -266,8 +269,8 @@ def run_pipeline(cfg: dict):
             # Match Qwen detections to tracks
             # ----------------------------
             matches = 0
-            join_tracks = {}
-            qwen_only_tracks = {}
+            join_tracks = {}       # reset for this stride frame
+            qwen_only_tracks = {}  # reset for this stride frame
             for det in parsed:
                 qb = det["bbox_2d"]
                 label = det.get("label", "unknown")
@@ -348,6 +351,19 @@ def run_pipeline(cfg: dict):
     )
     os.remove(raw_video_path)
     log(f"Video saved to {output_video_path}")
+    # Example: Export predictions_tracks.csv
+    with open("predictions_tracks.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["video_id", "track_id", "frame_start", "frame_end", "caption"])
+        for tid, tr in track_db.items():
+            writer.writerow([video_id, tid, tr["frame_start"], tr["frame_end"], tr["label"]])
+
+    # Example: Export predictions_mot.csv
+    with open("predictions_mot.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["video_id", "frame_id", "track_id", "x1", "y1", "x2", "y2", "conf", "category"])
+        for det in all_detections:  # all_detections = list of per-frame detection tuples
+            writer.writerow(det)
 
 # ============================================================
 # Entry point

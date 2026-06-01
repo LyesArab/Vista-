@@ -247,6 +247,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+vis.ipynb
 
 # IPython
 profile_default/
