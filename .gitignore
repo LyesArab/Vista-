@@ -777,7 +777,7 @@ FodyWeavers.xsd
 .gradio/
 /runs/
 /unsloth_compiled_cache/
-
+data/VistaCrash/images/
 *.pt
 *.pth
 *.ts
