@@ -146,6 +146,42 @@ class QwenVLHF(QwenVLforObjectDetection):
             gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
 
+    def caption_crop(self, crop, prompt: str) -> str:
+        """Zero-shot caption a single PIL image crop with the given prompt."""
+        b64 = image_to_base64(crop)
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": self.cfg["qwen"].get("system_prompt", "")}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": f"data:image;base64,{b64}"},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ]
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, _, _ = process_vision_info(
+            messages, return_video_kwargs=True, image_patch_size=16, return_video_metadata=True
+        )
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=None,
+            padding=True,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            out_ids = self.model.generate(**inputs, **self.sampling_params)
+        gen_ids = [out[len(inp):] for inp, out in zip(inputs.input_ids, out_ids)]
+        return self.processor.batch_decode(
+            gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
+
 
 class QwenVLUnsloth(QwenVLforObjectDetection):
     def __init__(self, model, processor, tokenizer, sampling_params, cfg, device):
@@ -191,6 +227,27 @@ class QwenVLUnsloth(QwenVLforObjectDetection):
         # Trim input_ids
         gen_ids = [out[len(inp) :] for inp, out in zip(inputs.input_ids, outputs)]
         return self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0]
+
+    def caption_crop(self, crop, prompt: str) -> str:
+        """Zero-shot caption a single PIL image crop with the given prompt."""
+        b64 = image_to_base64(crop)
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": self.cfg["qwen"].get("system_prompt", "")}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": f"data:image;base64,{b64}"},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ]
+        inputs = self.prepare_inputs_for_vllm(messages)
+        outputs = self.model.generate(**inputs, **self.sampling_params)
+        gen_ids = [out[len(inp):] for inp, out in zip(inputs.input_ids, outputs)]
+        return self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
 
 
 # ============================================================
@@ -296,20 +353,3 @@ def get_unsloth(model_id, device, cfg):
         device=device,
         cfg=cfg,
     )
-
-
-log("Starting video loop")
-
-start_time = time.time()
-frame_count = 0
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    # ...existing processing...
-    frame_count += 1
-
-end_time = time.time()
-fps = frame_count / (end_time - start_time)
-print(f"Detection/Tracking FPS: {fps:.2f}")

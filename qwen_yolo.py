@@ -7,7 +7,9 @@ import cv2
 import json
 import yaml
 import torch
+import csv
 import gc
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -15,7 +17,7 @@ from PIL import Image
 from ultralytics import YOLO
 from json_repair import repair_json
 from vista.qwen import get_model
-from vista.utils import set_seed, image_to_base64, resize_image, log, IGNORE_CATEGORIES
+from vista.utils import set_seed, image_to_base64, resize_image, log, IGNORE_CATEGORIES, YOLO_INITIAL_CAPTION, snap_to_vocabulary
 from vista.utils import get_emergency_level
 
 
@@ -135,7 +137,12 @@ def run_pipeline(cfg: dict):
     device = cfg["device"]
 
     log("Loading YOLO tracker")
-    yolo = YOLO(cfg["yolo"]["model"])
+    yolo_model_path = cfg["yolo"]["model"]
+    if not Path(yolo_model_path).exists():
+        fallback = cfg["yolo"].get("base_model", "yolo12x.pt")
+        log(f"Fine-tuned model not found at {yolo_model_path!r}, falling back to {fallback!r}")
+        yolo_model_path = fallback
+    yolo = YOLO(yolo_model_path)
 
 
     load_prediction_dir = cfg["qwen"].get("load_prediction_dir", None)
@@ -194,6 +201,11 @@ def run_pipeline(cfg: dict):
 
     join_tracks: Dict[int, Dict] = {}
     qwen_only_tracks: Dict[int, Dict] = {}
+    video_id = Path(video_path).stem
+    all_detections: list = []
+    final_tracks: Dict[int, Dict] = {}
+    loop_start_time = time.perf_counter()
+    yolo_time_total = 0.0
 
     while True:
         ret, frame = cap.read()
@@ -205,20 +217,26 @@ def run_pipeline(cfg: dict):
             log(f"Reached end_frame {end_frame}, stopping processing")
             break
 
+        _yolo_t0 = time.perf_counter()
         results = yolo.track(frame, persist=True, verbose=False, conf=cfg["yolo"].get("conf", None))[0]
+        yolo_time_total += time.perf_counter() - _yolo_t0
         active_tracks = {}
 
         if results.boxes.id is not None:
-            for box, tid, cls in zip(results.boxes.xyxy, results.boxes.id, results.boxes.cls):
+            for box, tid, cls, det_conf in zip(results.boxes.xyxy, results.boxes.id, results.boxes.cls, results.boxes.conf):
                 tid = int(tid.item())
+                yolo_class = results.names.get(int(cls.item()), "unknown")
+                initial_label = YOLO_INITIAL_CAPTION.get(yolo_class, yolo_class)
                 active_tracks[tid] = {
                     "bbox": box.cpu().numpy().tolist(),
-                    "label": track_db.get(tid, {}).get("label", results.names.get(int(cls.item()), "unknown")),
+                    "label": track_db.get(tid, {}).get("label", initial_label),
                     "emergency_level": track_db.get(tid, {}).get("emergency_level", 0),
+                    "conf": float(det_conf.item()),
                 }
         # Remove inactive tracks from track_db
         inactive_tids = set(track_db.keys()) - set(active_tracks.keys())
         for tid in inactive_tids:
+            final_tracks[tid] = track_db[tid]
             del track_db[tid]
         
         # Remove tracks belonging to ignored categories
@@ -273,7 +291,7 @@ def run_pipeline(cfg: dict):
             qwen_only_tracks = {}  # reset for this stride frame
             for det in parsed:
                 qb = det["bbox_2d"]
-                label = det.get("label", "unknown")
+                label = snap_to_vocabulary(det.get("label", "unknown"))
                 urgency_level = det.get("level", get_emergency_level(label))
 
                 best_tid = None
@@ -285,16 +303,16 @@ def run_pipeline(cfg: dict):
                         best_tid = tid
 
                 if best_tid is not None and best_score >= iou_thr:
+                    prev = track_db.get(best_tid, {})
                     track_db[best_tid] = {
                         "bbox": active_tracks[best_tid]["bbox"],
                         "label": label,
                         "emergency_level": urgency_level,
+                        "frame_start": prev.get("frame_start", frame_idx),
+                        "frame_end": frame_idx,
+                        "conf": active_tracks[best_tid].get("conf", 1.0),
                     }
-                    join_tracks[best_tid] = {
-                        "bbox": active_tracks[best_tid]["bbox"],
-                        "label": label,
-                        "emergency_level": urgency_level,
-                    }
+                    join_tracks[best_tid] = track_db[best_tid]
                     matches += 1
                 else:
                     # Create a new track for Qwen-only detection
@@ -303,6 +321,9 @@ def run_pipeline(cfg: dict):
                         "bbox": qb,
                         "label": label,
                         "emergency_level": urgency_level,
+                        "frame_start": frame_idx,
+                        "frame_end": frame_idx,
+                        "conf": 1.0,
                     }
                     track_db[new_tid] = qwen_only_tracks[new_tid]
             log(f"YOLO detected {len(active_tracks)} tracks, Qwen detected {len(parsed)} objects, matched {matches}")
@@ -315,8 +336,11 @@ def run_pipeline(cfg: dict):
         for tid, tr in active_tracks.items():
             if tid not in track_db:
                 track_db[tid] = tr
+                track_db[tid]["frame_start"] = frame_idx
             else:
                 track_db[tid]["bbox"] = tr["bbox"]
+                track_db[tid]["conf"] = tr["conf"]
+            track_db[tid]["frame_end"] = frame_idx
                 
         if merge_method == "intersection":
             # Keep only tracks that were matched with Qwen detections
@@ -332,10 +356,27 @@ def run_pipeline(cfg: dict):
                 out_dir / f"annotated_frame_{frame_idx:06d}.png"
             )
         writer.write(annotated)
+        for tid, tr in track_db.items():
+            x1, y1, x2, y2 = map(int, tr["bbox"])
+            all_detections.append((
+                video_id, frame_idx, tid,
+                x1, y1, x2, y2,
+                round(tr.get("conf", 1.0), 4),
+                tr.get("label", "unknown"),
+            ))
         frame_idx += 1
 
     cap.release()
     writer.release()
+
+    for tid, tr in track_db.items():
+        final_tracks[tid] = tr
+    frames_processed = frame_idx - start_frame
+    elapsed = time.perf_counter() - loop_start_time
+    fps_achieved = frames_processed / elapsed if elapsed > 0 else 0
+    yolo_fps = frames_processed / yolo_time_total if yolo_time_total > 0 else 0
+    log(f"Processed {frames_processed} frames in {elapsed:.1f}s — total pipeline: {fps_achieved:.1f} FPS")
+    log(f"Shallow stage (YOLO tracking only): {yolo_fps:.1f} FPS  (challenge threshold: >=5 FPS)")
 
     log(f"Converting video to H.264: {output_video_path}")
     subprocess.run(
@@ -351,19 +392,27 @@ def run_pipeline(cfg: dict):
     )
     os.remove(raw_video_path)
     log(f"Video saved to {output_video_path}")
-    # Example: Export predictions_tracks.csv
-    with open("predictions_tracks.csv", "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["video_id", "track_id", "frame_start", "frame_end", "caption"])
-        for tid, tr in track_db.items():
-            writer.writerow([video_id, tid, tr["frame_start"], tr["frame_end"], tr["label"]])
 
-    # Example: Export predictions_mot.csv
-    with open("predictions_mot.csv", "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["video_id", "frame_id", "track_id", "x1", "y1", "x2", "y2", "conf", "category"])
-        for det in all_detections:  # all_detections = list of per-frame detection tuples
-            writer.writerow(det)
+    predictions_tracks_path = out_dir / "predictions_tracks.csv"
+    with open(predictions_tracks_path, "w", newline="") as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(["video_id", "track_id", "frame_start", "frame_end", "caption"])
+        for tid, tr in final_tracks.items():
+            csv_writer.writerow([
+                video_id, tid,
+                tr.get("frame_start", 0),
+                tr.get("frame_end", 0),
+                tr.get("label", ""),
+            ])
+    log(f"Saved {predictions_tracks_path}")
+
+    predictions_mot_path = out_dir / "predictions_mot.csv"
+    with open(predictions_mot_path, "w", newline="") as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(["video_id", "frame_id", "track_id", "x1", "y1", "x2", "y2", "conf", "category"])
+        for det in all_detections:
+            csv_writer.writerow(det)
+    log(f"Saved {predictions_mot_path}")
 
 # ============================================================
 # Entry point

@@ -27,4 +27,5 @@ from .severity import (
     emergency_vehicle_prompt,
     YOLO_INITIAL_CAPTION,
     YOLO_TO_CATEGORY,
+    snap_to_vocabulary,
 )
