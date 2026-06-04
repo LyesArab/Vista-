@@ -70,7 +70,7 @@ class SeverityPipeline(VistaPipeline):
         yolo_model: YOLO,
         vlm: Any | None = None,
         caption_stride: int = 30,
-        yolo_conf: float = 0.05,
+        yolo_conf: float = 0.9,
         history_len: int = 5,
         check_emergency: bool = True,
     ) -> None:

@@ -12,6 +12,8 @@ import gc
 import time
 from pathlib import Path
 from typing import Dict
+import importlib
+import inspect
 
 from PIL import Image
 from ultralytics import YOLO
@@ -154,6 +156,47 @@ def run_pipeline(cfg: dict):
         log("Loading Qwen processor and model")
         model = get_model(cfg)
         log("Models loaded successfully")
+
+    # If the config specifies a pipeline class, try to import and run it.
+    pipeline_class_path = cfg.get("pipeline", {}).get("class")
+    if pipeline_class_path:
+        try:
+            mod_name, cls_name = pipeline_class_path.rsplit(".", 1)
+            mod = importlib.import_module(mod_name)
+            PipelineCls = getattr(mod, cls_name)
+        except Exception as e:
+            log(f"Failed to import pipeline class {pipeline_class_path}: {e}")
+            PipelineCls = None
+
+        if PipelineCls is not None:
+            # Try flexible instantiation: (yolo, vlm/model, **kwargs) or fallbacks
+            vlm = model
+            p_cfg = cfg.get("pipeline", {})
+            # pull some commonly used pipeline args if present
+            kwargs = {}
+            for k in ("caption_stride", "yolo_conf", "history_len", "check_emergency", "iou_threshold", "yolo_conf"):
+                if k in p_cfg:
+                    kwargs[k] = p_cfg[k]
+
+            pipeline = None
+            try:
+                # preferred constructor: (yolo_model, vlm, ...)
+                pipeline = PipelineCls(yolo, vlm, **kwargs)
+            except TypeError:
+                try:
+                    pipeline = PipelineCls(yolo, vlm)
+                except TypeError:
+                    try:
+                        pipeline = PipelineCls(yolo)
+                    except Exception as e:
+                        log(f"Failed to instantiate pipeline {pipeline_class_path}: {e}")
+                        pipeline = None
+
+            if pipeline is not None:
+                log(f"Running custom pipeline: {pipeline_class_path}")
+                # delegate to a generic runner that calls pipeline.forward()
+                _run_vista_pipeline(pipeline, cfg, out_dir, video_path)
+                return
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -413,6 +456,115 @@ def run_pipeline(cfg: dict):
         for det in all_detections:
             csv_writer.writerow(det)
     log(f"Saved {predictions_mot_path}")
+
+
+def _run_vista_pipeline(pipeline, cfg, out_dir: Path, video_path: str):
+    """Generic runner for VistaPipeline-like objects (calls forward on each frame).
+
+    Outputs: annotated video, predictions_tracks.csv, predictions_mot.csv (same layout as other runner).
+    """
+    import cv2
+    from PIL import Image
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open video for pipeline runner")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    raw_video_path = str(out_dir / "annotated_raw.mp4")
+    output_video_path = str(out_dir / "annotated.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    writer = cv2.VideoWriter(raw_video_path, fourcc, fps, (W, H))
+
+    track_db = {}
+    all_detections = []
+    final_tracks = {}
+
+    frame_idx = 0
+    loop_start_time = time.perf_counter()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        # pipeline.forward returns a FrameResult with detections
+        try:
+            res = pipeline.forward(pil_frame, frame_idx)
+        except Exception as e:
+            log(f"Pipeline forward() error at frame {frame_idx}: {e}")
+            frame_idx += 1
+            continue
+
+        # build track_db from detections
+        for det in res.detections:
+            tid = getattr(det, "track_id", None)
+            bbox = tuple(det.bbox)
+            label = getattr(det, "category", "unknown")
+            conf = getattr(det, "confidence", 1.0)
+            track_db[tid] = {
+                "bbox": bbox,
+                "label": label,
+                "conf": conf,
+                "frame_start": track_db.get(tid, {}).get("frame_start", frame_idx),
+                "frame_end": frame_idx,
+            }
+            x1, y1, x2, y2 = map(int, bbox)
+            all_detections.append((Path(video_path).stem, frame_idx, tid, x1, y1, x2, y2, round(conf, 4), label))
+
+        # draw tracks
+        annotated = frame.copy()
+        for tid, tr in track_db.items():
+            x1, y1, x2, y2 = map(int, tr["bbox"])
+            label = tr.get("label", "")
+            color = (0, 0, 255) if "person" in label.lower() else (255, 0, 0)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(annotated, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        writer.write(annotated)
+        frame_idx += 1
+
+    cap.release()
+    writer.release()
+
+    for tid, tr in track_db.items():
+        final_tracks[tid] = tr
+
+    predictions_tracks_path = out_dir / "predictions_tracks.csv"
+    with open(predictions_tracks_path, "w", newline="") as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(["video_id", "track_id", "frame_start", "frame_end", "caption"])
+        for tid, tr in final_tracks.items():
+            csv_writer.writerow([Path(video_path).stem, tid, tr.get("frame_start", 0), tr.get("frame_end", 0), tr.get("label", "")])
+    log(f"Saved {predictions_tracks_path}")
+
+    predictions_mot_path = out_dir / "predictions_mot.csv"
+    with open(predictions_mot_path, "w", newline="") as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(["video_id", "frame_id", "track_id", "x1", "y1", "x2", "y2", "conf", "category"])
+        for det in all_detections:
+            csv_writer.writerow(det)
+    log(f"Saved {predictions_mot_path}")
+
+    # Try to convert to H.264 like original runner
+    try:
+        log(f"Converting video to H.264: {output_video_path}")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", raw_video_path,
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            output_video_path,
+        ], check=True)
+        os.remove(raw_video_path)
+        log(f"Video saved to {output_video_path}")
+    except Exception as e:
+        log(f"ffmpeg conversion failed or not available: {e}")
 
 # ============================================================
 # Entry point
