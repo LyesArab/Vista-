@@ -63,6 +63,8 @@ class SeverityPipeline(VistaPipeline):
             When ``True``, trucks and buses are sent to the VLM with an
             emergency-vehicle probe before the severity prompt, allowing
             ambulances / police cars to be reclassified automatically.
+        cfg:
+            Full pipeline config dict (from YAML). Used to read user_prompt.
     """
 
     def __init__(
@@ -73,6 +75,7 @@ class SeverityPipeline(VistaPipeline):
         yolo_conf: float = 0.9,
         history_len: int = 5,
         check_emergency: bool = True,
+        cfg: dict | None = None,
     ) -> None:
         self.yolo = yolo_model
         self.vlm = vlm
@@ -80,6 +83,7 @@ class SeverityPipeline(VistaPipeline):
         self.yolo_conf = yolo_conf
         self.history_len = history_len
         self.check_emergency = check_emergency
+        self.cfg = cfg or {}
 
         # per-video state
         self._track_db: dict[int, dict] = {}
@@ -147,7 +151,6 @@ class SeverityPipeline(VistaPipeline):
                 # upgrade "car" to "emergency_vehicle" if VLM confirms
                 if tr["category"] == "car" and _is_emergency_caption(caption):
                     active[tid]["category"] = "emergency_vehicle"
-                    # emergency vehicles don't need a severity ranking
                     active[tid]["caption"] = caption
                     self._caption_history[tid].clear()
                     continue
@@ -197,10 +200,14 @@ class SeverityPipeline(VistaPipeline):
             except Exception:
                 pass
 
+        # build prompt from severity.py + optional user_prompt from yaml
+        user_prompt = self.cfg.get("qwen", {}).get("user_prompt", "")
         if cat == "person":
             prompt = person_severity_prompt()
         else:
             prompt = vehicle_severity_prompt()
+        if user_prompt:
+            prompt = prompt + "\n" + user_prompt
 
         try:
             return self.vlm.caption_crop(crop, prompt).strip()

@@ -65,4 +65,7 @@ qwen:
 
     Example:
     [{"bbox_2d": [10, 30, 200, 160], "label": "heavily damaged"}, {"bbox_2d": [220, 50, 260, 120], "label": "injured, lying"}]
-  user_prompt: ""
+  user_prompt: "Analyse this drone footage frame. For each object inside
+    the bounding box, assign exactly one severity label from
+    the provided lists. Focus on visible damage, posture,
+    and behaviour."

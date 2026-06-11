@@ -177,8 +177,11 @@ def run_pipeline(cfg: dict):
             for k in ("caption_stride", "yolo_conf", "history_len", "check_emergency", "iou_threshold", "yolo_conf"):
                 if k in p_cfg:
                     kwargs[k] = p_cfg[k]
+            # ajoute juste cette ligne après :
+            kwargs["cfg"] = cfg
 
             pipeline = None
+            
             try:
                 # preferred constructor: (yolo_model, vlm, ...)
                 pipeline = PipelineCls(yolo, vlm, **kwargs)
